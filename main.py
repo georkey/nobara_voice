@@ -1,101 +1,74 @@
 import asyncio
+from pathlib import Path
 import logging
-import json
-import time
-import sys
 
+import openwakeword as oww
 import pyaudio
-import numpy as np
-# import openwakeword
-# from openwakeword.model import Model as WakeModel
-from vosk import Model as VoskModel, KaldiRecognizer
 
-from wakeword.openww import model, md_key
-from command_service.dbus_commands import set_volume
+from wakeword.wakeword_service import WakeWordOWW
+from speech2txt.recog_service import VOSKRecignizer
 
 logger = logging.getLogger()
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.DEBUG)
 
-# Wakeword model
-ww_block = model
-
-VOSK_MODEL_PATH = "./vosk_model/vosk-model-small-ru-0.22"
 SAMPLE_RATE = 16000
-CHUNK_SIZE = 1280  # openWakeWord рекомендует 1280 (80 мс при 16кГц)
-# -----------------------------------------------
+CHUNK_SIZE = 1280
 
-# Инициализация VOSK
-vosk_model = VoskModel(VOSK_MODEL_PATH)
-recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
-recognizer.SetWords(False)  # не нужны детали слов
+waiting_for_command = asyncio.Event()
 
-# Настройка PyAudio
-p = pyaudio.PyAudio()
-stream = p.open(format=pyaudio.paInt16,
-                channels=1,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE)
 
-# Состояния
-listening_for_wake = True  # True = ждём wakeword, False = слушаем команду
-command_audio = []          # буфер для команды
-last_voice_time = None      # время последнего голоса (для таймаута)
-SILENCE_TIMEOUT = 3       # секунд тишины = конец команды
+async def stream_task(queue: asyncio.Queue):
+    p = pyaudio.PyAudio()
+    loop = asyncio.get_running_loop()
 
-logger.info("Start listening...")
+    def audio_callback(in_data, frame_count, time_info, status):
+        asyncio.run_coroutine_threadsafe(queue.put(in_data), loop)
+        return (None, pyaudio.paContinue)
 
-try:
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE, stream_callback=audio_callback)
+    stream.start_stream()
+    while stream.is_active():
+        await asyncio.sleep(0.1)
+    # while True:
+    #     logging.debug(f"Available data {stream.get_read_available()}")
+    #     data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+    #     await queue.put(data)
+    #     await asyncio.sleep(0.08)
+
+
+async def recog_task(queue: asyncio.Queue, recognizer):
+    logging.info("Start recognizing...")
+    cmd = await recognizer.recognize(queue)
+    logging.info(f"Command: {cmd}")
+    waiting_for_command.clear()
+
+
+async def wakeword_task(queue: asyncio.Queue, ww_detector, recognizer):
+    logging.info("Wakeword starts listening...")
     while True:
-        # Читаем аудио с микрофона
-        audio_chunk = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-        audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
+        if waiting_for_command.is_set():
+            logging.debug("Wakeword loop, waiting for command finising")
+            await asyncio.sleep(0.1)
+            continue
+        try:
+            chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            continue
+        detected = await ww_detector.predict_chunk(chunk)
+        if detected:
+            logging.info("Wakeword detected")
+            waiting_for_command.set()
+            asyncio.create_task(recog_task(queue, recognizer))
+            await asyncio.sleep(3)
 
-        if listening_for_wake:
-            # Режим ожидания wakeword
-            prediction = ww_block.predict(audio_int16)
 
-            # Проверяем порог для нашего ключевого слова (по умолчанию 0.5)
-            if prediction[md_key] > 0.5:
-                logging.info("Wakeword detected, waiting for command!")
-                listening_for_wake = False
-                command_audio = []          # очищаем буфер команды
-                last_voice_time = time.time()
-                # Не сбрасываем recognizer? VOSK продолжит с того места, но лучше начать заново
-                recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)  # свежий recognizer
+async def main():
+    audio_q = asyncio.Queue()
+    wakeword = WakeWordOWW(model_path=Path(oww.MODELS["hey_mycroft"]["model_path"]))
+    recog = VOSKRecignizer(model_path="./vosk_model/vosk-model-small-ru-0.22", sample_rate=SAMPLE_RATE)
+    receive_task = asyncio.create_task(stream_task(audio_q))
+    ww_task = asyncio.create_task(wakeword_task(audio_q, wakeword, recog))
+    await receive_task
 
-        else:
-            # Режим распознавания команды через VOSK
-            # Добавляем аудио в буфер (VOSK всё равно нужен непрерывный поток)
-            command_audio.append(audio_int16)
-
-            # Передаём в VOSK
-            if recognizer.AcceptWaveform(audio_chunk):
-                # Получили финальный результат (конец фразы)
-                result = json.loads(recognizer.Result())
-                text = result.get("text", "")
-                if text:
-                    logging.info(f"Command received: {text}")
-                # Возвращаемся к прослушиванию wakeword
-                listening_for_wake = True
-                logging.info("Return to waiting mode")
-            else:
-                # Ещё не конец фразы, но можно проверить таймаут по тишине
-                # Простейшая детекция тишины: если амплитуда мала, считаем тишиной
-                if (np.max(np.abs(audio_int16)) < 500):
-                    if (time.time() - last_voice_time > SILENCE_TIMEOUT):  # порог тишины
-                        partial = json.loads(recognizer.PartialResult())
-                        text = partial.get("partial", "")
-                        if text:
-                            logging.info(f"Command received (timeout): {text}")
-                        listening_for_wake = True
-                        logging.info("Return to waiting mode")
-                # else:
-                #     last_voice_time = time.time()  # обновляем время последнего голоса
-
-except KeyboardInterrupt:
-    logging.info("Shutdown...")
-finally:
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+if __name__ == "__main__":
+    asyncio.run(main())
